@@ -80,11 +80,12 @@ export function useDashboard() {
           if (parsed.event_type === 'connected') {
             if (parsed.data?.pipeline) setStatus(parsed.data.pipeline);
             if (parsed.data?.stats) setStats(parsed.data.stats);
+            if (Array.isArray(parsed.data?.history)) setHistory(parsed.data.history);
           } else if (parsed.event_type === 'pipeline_update') {
             setStatus(parsed.data as PipelineStatus);
           } else if (parsed.event_type === 'build_complete') {
             const newBuild = parsed.data as BuildRecord;
-            setHistory((prev) => [newBuild, ...prev]);
+            setHistory((prev) => [newBuild, ...prev.filter(b => b.build_id !== newBuild.build_id)]);
             // Re-fetch stats to sync computed metrics
             fetch('/api/stats')
               .then((r) => (r.ok ? r.json() : null))
@@ -105,18 +106,17 @@ export function useDashboard() {
         setIsConnected(false);
         es.close();
         if (retryTimeoutRef.current) clearTimeout(retryTimeoutRef.current);
-        retryTimeoutRef.current = window.setTimeout(connectSSE, 3000);
+        retryTimeoutRef.current = window.setTimeout(connectSSE, 2000);
       };
     }
 
     connectSSE();
 
-    // Fallback polling every 5s if SSE disconnects
+    // Active polling every 2.5s ensures mobile devices (iOS/Android) stay updated
+    // even if background SSE connections are throttled or suspended by mobile OS
     const pollInterval = window.setInterval(() => {
-      if (!isConnected) {
-        fetchInitialData();
-      }
-    }, 5000);
+      fetchInitialData();
+    }, 2500);
 
     return () => {
       if (eventSourceRef.current) {
@@ -127,7 +127,7 @@ export function useDashboard() {
       }
       clearInterval(pollInterval);
     };
-  }, [fetchInitialData, isConnected]);
+  }, [fetchInitialData]);
 
   return {
     status,

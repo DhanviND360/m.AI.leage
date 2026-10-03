@@ -11,6 +11,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -111,6 +112,50 @@ class DashboardEventBus:
         self._build_history: Deque[BuildRecord] = deque(maxlen=50)
         self._stats = DashboardStats()
         self._event_log: Deque[DashboardEvent] = deque(maxlen=200)
+        self._load_state_from_disk()
+
+    @property
+    def state_file(self) -> Path:
+        return Path.cwd() / ".mileage" / "dashboard_state.json"
+
+    @property
+    def events_file(self) -> Path:
+        return Path.cwd() / ".mileage" / "dashboard_events.jsonl"
+
+    def _save_state_to_disk(self) -> None:
+        """Persist state to disk for cross-process synchronization."""
+        try:
+            p = self.state_file
+            p.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "pipeline": self._pipeline_status.model_dump(),
+                "stats": self._stats.model_dump(),
+                "history": [b.model_dump() for b in self._build_history],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
+            tmp.replace(p)
+        except Exception:
+            pass
+
+    def _load_state_from_disk(self) -> None:
+        """Load state from disk if written by another process."""
+        try:
+            p = self.state_file
+            if p.is_file():
+                raw = p.read_text(encoding="utf-8")
+                data = json.loads(raw)
+                if "pipeline" in data and isinstance(data["pipeline"], dict):
+                    self._pipeline_status = PipelineStatus.model_validate(data["pipeline"])
+                if "stats" in data and isinstance(data["stats"], dict):
+                    self._stats = DashboardStats.model_validate(data["stats"])
+                if "history" in data and isinstance(data["history"], list):
+                    self._build_history.clear()
+                    for item in reversed(data["history"][:50]):
+                        self._build_history.appendleft(BuildRecord.model_validate(item))
+        except Exception:
+            pass
 
     @classmethod
     def get_instance(cls) -> "DashboardEventBus":
@@ -121,9 +166,35 @@ class DashboardEventBus:
                     cls._instance = cls()
         return cls._instance
 
+    def clear(self) -> None:
+        """Clear all in-memory and disk records (for testing)."""
+        self._build_history.clear()
+        self._event_log.clear()
+        self._pipeline_status = PipelineStatus()
+        self._stats = DashboardStats()
+        try:
+            if self.state_file.is_file():
+                self.state_file.unlink(missing_ok=True)
+            if self.events_file.is_file():
+                self.events_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     @classmethod
     def reset_instance(cls) -> None:
-        """Reset the singleton (for testing)."""
+        """Reset the singleton and disk state (for testing)."""
+        if cls._instance is not None:
+            cls._instance.clear()
+        else:
+            try:
+                sf = Path.cwd() / ".mileage" / "dashboard_state.json"
+                if sf.is_file():
+                    sf.unlink(missing_ok=True)
+                ef = Path.cwd() / ".mileage" / "dashboard_events.jsonl"
+                if ef.is_file():
+                    ef.unlink(missing_ok=True)
+            except Exception:
+                pass
         cls._instance = None
 
     def subscribe(self) -> asyncio.Queue:
@@ -144,6 +215,17 @@ class DashboardEventBus:
     def publish(self, event: DashboardEvent) -> None:
         """Publish an event to all subscribers (thread-safe, sync)."""
         self._event_log.append(event)
+
+        # Append to shared event log for cross-process SSE tailing
+        try:
+            ef = self.events_file
+            ef.parent.mkdir(parents=True, exist_ok=True)
+            with open(ef, "a", encoding="utf-8") as f:
+                f.write(event.model_dump_json() + "\n")
+        except Exception:
+            pass
+
+        self._save_state_to_disk()
 
         with self._sub_lock:
             dead_queues = []
@@ -180,6 +262,7 @@ class DashboardEventBus:
         """Record a completed build and update stats."""
         self._build_history.appendleft(build)
         self._recompute_stats()
+        self._save_state_to_disk()
         self.publish(DashboardEvent(
             event_type="build_complete",
             data=build.model_dump(),
@@ -221,14 +304,17 @@ class DashboardEventBus:
 
     @property
     def pipeline_status(self) -> PipelineStatus:
+        self._load_state_from_disk()
         return self._pipeline_status
 
     @property
     def stats(self) -> DashboardStats:
+        self._load_state_from_disk()
         return self._stats
 
     @property
     def build_history(self) -> List[BuildRecord]:
+        self._load_state_from_disk()
         return list(self._build_history)
 
     @property

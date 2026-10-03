@@ -35,12 +35,12 @@ from mileage.ui.console import console
 # We avoid heavy deps (FastAPI/Starlette) to keep the tool lightweight.
 # Uses http.server with async SSE via threading.
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 
 def get_local_ip() -> str:
-    """Detect the machine's LAN IP address."""
+    """Detect the machine's primary LAN IP address."""
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(0.5)
@@ -50,6 +50,22 @@ def get_local_ip() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def get_all_local_ips() -> list:
+    """Detect all active LAN, Wi-Fi, and Hotspot IPv4 addresses on the host."""
+    ips = []
+    try:
+        hostname = socket.gethostname()
+        for ip in socket.gethostbyname_ex(hostname)[2]:
+            if not ip.startswith("127.") and ":" not in ip and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    primary = get_local_ip()
+    if primary not in ips and primary != "127.0.0.1":
+        ips.insert(0, primary)
+    return ips or ["127.0.0.1"]
 
 
 class DashboardRequestHandler(BaseHTTPRequestHandler):
@@ -67,13 +83,14 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
     def _set_cors_headers(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Cache-Control")
 
     def _json_response(self, data, status=200):
         body = json.dumps(data, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self._set_cors_headers()
+        self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -104,12 +121,15 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._handle_static(parsed.path)
 
     def _handle_status(self):
+        self.event_bus._load_state_from_disk()
         self._json_response(self.event_bus.pipeline_status.model_dump())
 
     def _handle_stats(self):
+        self.event_bus._load_state_from_disk()
         self._json_response(self.event_bus.stats.model_dump())
 
     def _handle_history(self):
+        self.event_bus._load_state_from_disk()
         builds = [b.model_dump() for b in self.event_bus.build_history]
         self._json_response(builds)
 
@@ -121,20 +141,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self._json_response({})
 
     def _handle_sse(self):
-        """Server-Sent Events stream for live dashboard updates."""
+        """Server-Sent Events stream for live dashboard updates across network devices."""
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
         self._set_cors_headers()
         self.end_headers()
 
-        # Send initial status
+        # Reload latest state from disk so new connections get immediate current status
+        self.event_bus._load_state_from_disk()
+
+        # Send initial status frame including build history
         initial = DashboardEvent(
             event_type="connected",
             data={
                 "pipeline": self.event_bus.pipeline_status.model_dump(),
                 "stats": self.event_bus.stats.model_dump(),
+                "history": [b.model_dump() for b in self.event_bus.build_history],
             },
         )
         try:
@@ -143,11 +168,19 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         except Exception:
             return
 
-        # Create a sync-compatible polling mechanism
-        # We use the event bus's event log and poll for new events
         last_seen = len(self.event_bus._event_log)
+        events_file = self.event_bus.events_file
+        file_pos = 0
+        if events_file.is_file():
+            try:
+                file_pos = events_file.stat().st_size
+            except Exception:
+                file_pos = 0
+
         try:
+            keepalive_counter = 0
             while True:
+                # 1. In-process events check
                 current_len = len(self.event_bus._event_log)
                 if current_len > last_seen:
                     events = list(self.event_bus._event_log)
@@ -159,12 +192,40 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                             return
                     last_seen = current_len
 
-                # Send keepalive every 15s
-                try:
-                    self.wfile.write(b": keepalive\n\n")
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    return
+                # 2. Cross-process events check (from mileage start in another terminal)
+                if events_file.is_file():
+                    try:
+                        curr_size = events_file.stat().st_size
+                        if curr_size > file_pos:
+                            with open(events_file, "r", encoding="utf-8") as f:
+                                f.seek(file_pos)
+                                new_lines = f.readlines()
+                                file_pos = f.tell()
+
+                            for line in new_lines:
+                                line = line.strip()
+                                if line:
+                                    try:
+                                        ev_data = json.loads(line)
+                                        ev = DashboardEvent.model_validate(ev_data)
+                                        self.wfile.write(ev.to_sse().encode("utf-8"))
+                                        self.wfile.flush()
+                                    except Exception:
+                                        pass
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
+                    except Exception:
+                        pass
+
+                # 3. Keepalive ping every 5 seconds for mobile network carrier stability
+                keepalive_counter += 1
+                if keepalive_counter >= 10:
+                    keepalive_counter = 0
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        return
 
                 time.sleep(0.5)
         except Exception:
@@ -204,7 +265,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
 
 class DashboardServer:
-    """Manages the m.AI.leage dashboard HTTP server lifecycle."""
+    """Manages the m.AI.leage dashboard HTTP server lifecycle with multi-device support."""
 
     def __init__(
         self,
@@ -220,11 +281,11 @@ class DashboardServer:
         )
         self.metrics_tracker = metrics_tracker
         self.event_bus = DashboardEventBus.get_instance()
-        self._server: Optional[HTTPServer] = None
+        self._server: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
 
     def start(self, blocking: bool = True) -> None:
-        """Start the dashboard server."""
+        """Start the multi-threaded dashboard server accessible from phone and desktop."""
         # Configure handler class
         handler = type(
             "ConfiguredHandler",
@@ -236,20 +297,23 @@ class DashboardServer:
             },
         )
 
-        self._server = HTTPServer((self.host, self.port), handler)
+        self._server = ThreadingHTTPServer((self.host, self.port), handler)
+        self._server.daemon_threads = True
         self._server.timeout = 0.5
 
-        local_ip = get_local_ip()
+        local_ips = get_all_local_ips()
 
         logger.info(
             "Dashboard server starting on %s:%d", self.host, self.port
         )
         console.print(f"\n  [bold cyan]🚀 m.AI.leage Command Center[/bold cyan]")
-        console.print(f"  [dim]────────────────────────────────[/dim]")
-        console.print(f"  [white]Local:[/white]   [bold green]http://localhost:{self.port}[/bold green]")
-        console.print(f"  [white]Network:[/white] [bold green]http://{local_ip}:{self.port}[/bold green]")
-        console.print(f"  [dim]────────────────────────────────[/dim]")
-        console.print(f"  [dim]Open on your phone to monitor builds![/dim]\n")
+        console.print(f"  [dim]────────────────────────────────────────────────[/dim]")
+        console.print(f"  [white]Local (Laptop):[/white]   [bold green]http://localhost:{self.port}[/bold green]")
+        for idx, ip in enumerate(local_ips):
+            label = "Wi-Fi / LAN" if idx == 0 else "Hotspot / Network"
+            console.print(f"  [white]Phone ({label}):[/white] [bold green]http://{ip}:{self.port}[/bold green]")
+        console.print(f"  [dim]────────────────────────────────────────────────[/dim]")
+        console.print(f"  [dim]Connect your phone to the same Wi-Fi or Hotspot & open the URL above![/dim]\n")
 
         if blocking:
             try:
